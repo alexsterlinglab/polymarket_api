@@ -68,8 +68,15 @@ def _parse_list(value: Any) -> List[str]:
         return [s]
     return [str(value)]
 
-def http_json(method: str, url: str, params: Optional[Dict[str, Any]] = None, json_body: Any = None,
-             timeout_s: int = 30, max_retries: int = 6, backoff_s: float = 0.8) -> Any:
+def http_json(
+    method: str,
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    json_body: Any = None,
+    timeout_s: int = 30,
+    max_retries: int = 6,
+    backoff_s: float = 0.8,
+) -> Any:
     headers = {"Accept": "application/json", "User-Agent": "polymarket-mvp-api/1.0"}
     for attempt in range(1, max_retries + 1):
         try:
@@ -78,7 +85,14 @@ def http_json(method: str, url: str, params: Optional[Dict[str, Any]] = None, js
             else:
                 headers2 = dict(headers)
                 headers2["Content-Type"] = "application/json"
-                r = requests.request(method.upper(), url, params=params, headers=headers2, json=json_body, timeout=timeout_s)
+                r = requests.request(
+                    method.upper(),
+                    url,
+                    params=params,
+                    headers=headers2,
+                    json=json_body,
+                    timeout=timeout_s,
+                )
 
             if r.status_code == 429 or (500 <= r.status_code <= 599):
                 time.sleep(backoff_s * (2 ** (attempt - 1)))
@@ -192,10 +206,8 @@ def time_to_deadline_hours(end_iso: str) -> Optional[float]:
 _year_re = re.compile(r"\b(20\d{2})\b")
 
 def deadline_suspicious(question: str, end_date: str, ttd_h: Optional[float]) -> int:
-    # 1) very negative deadline
     if ttd_h is not None and ttd_h < -24:
         return 1
-    # 2) question contains year > end_date year (common mismatch)
     q_years = [int(y) for y in _year_re.findall(question or "")]
     d = parse_iso_datetime(end_date or "")
     if q_years and d is not None:
@@ -206,11 +218,10 @@ def deadline_suspicious(question: str, end_date: str, ttd_h: Optional[float]) ->
     return 0
 
 def quality_score(vol24: float, spread_mean: Optional[float], min_ask_size: float) -> float:
-    # simple monotonic score: more vol, lower spread, more depth
     sp = spread_mean if spread_mean is not None else 99.0
-    vol_part = math.log10(max(vol24, 1.0))  # 0..~6
-    depth_part = math.log10(max(min_ask_size, 1.0))  # 0..~4
-    spread_part = max(0.1, (10.0 / (sp + 0.5)))  # smaller spread -> bigger
+    vol_part = math.log10(max(vol24, 1.0))
+    depth_part = math.log10(max(min_ask_size, 1.0))
+    spread_part = max(0.1, (10.0 / (sp + 0.5)))
     return round((vol_part * 2.2) + (depth_part * 1.2) + (spread_part * 1.8), 4)
 
 def tier_for(vol24: float, spread_mean: Optional[float], min_ask_size: float) -> str:
@@ -222,11 +233,63 @@ def tier_for(vol24: float, spread_mean: Optional[float], min_ask_size: float) ->
         return "B"
     return "C"
 
+def _norm_outcome_name(s: str) -> str:
+    return (s or "").strip().strip('"').strip("'").strip().lower()
+
+def _find_yes_no_indices(outs: List[str]) -> Optional[Tuple[int, int]]:
+    idx_yes = None
+    idx_no = None
+    for i, o in enumerate(outs):
+        n = _norm_outcome_name(o)
+        if n == "yes":
+            idx_yes = i
+        elif n == "no":
+            idx_no = i
+    if idx_yes is None or idx_no is None:
+        return None
+    return idx_yes, idx_no
+
+def _bucket_for(
+    vol24: float,
+    liq: float,
+    spread_mean: Optional[float],
+    min_ask_size: float,
+    ttd_h: Optional[float],
+    deadline_flag: int,
+    yes_ask: Optional[float],
+    no_ask: Optional[float],
+) -> str:
+    if deadline_flag == 1:
+        return "SKIP"
+    if spread_mean is None:
+        return "SKIP"
+    if min_ask_size < 20 or vol24 < 1000 or spread_mean > 4.0:
+        return "SKIP"
+
+    if ttd_h is not None:
+        if ttd_h < 2:
+            return "WATCH"
+        if ttd_h > 8760:
+            return "WATCH"
+
+    if yes_ask is not None and (yes_ask < 0.03 or yes_ask > 0.97):
+        return "WATCH"
+    if no_ask is not None and (no_ask < 0.03 or no_ask > 0.97):
+        return "WATCH"
+
+    trade_ok = (
+        spread_mean <= 3.0
+        and min_ask_size >= 50
+        and (vol24 >= 20000 or liq >= 20000)
+        and (ttd_h is None or (ttd_h >= 6 and ttd_h <= 4320))
+    )
+    return "TRADE" if trade_ok else "WATCH"
+
 def build_candidates(max_markets: int = 2000) -> List[Dict[str, Any]]:
     markets = fetch_gamma_markets(closed=False, limit=200, max_markets=max_markets)
 
     tradable = []
-    token_ids = []
+    token_ids: List[str] = []
     for m in markets:
         if bool(m.get("enableOrderBook")) is not True:
             continue
@@ -236,39 +299,67 @@ def build_candidates(max_markets: int = 2000) -> List[Dict[str, Any]]:
             continue
         if m.get("active") is False:
             continue
-        tids = _parse_list(m.get("clobTokenIds"))
-        if len(tids) < 2:
-            continue
-        tradable.append(m)
-        token_ids.extend([tids[0], tids[1]])
 
-    # dedupe tokens
+        tids = _parse_list(m.get("clobTokenIds"))
+        outs = _parse_list(m.get("outcomes"))
+        if len(tids) < 2 or len(outs) < 2:
+            continue
+
+        yn = _find_yes_no_indices(outs)
+        if yn is None:
+            continue
+
+        tradable.append(m)
+
+        for t in tids[:2]:
+            token_ids.append(t)
+
     token_ids = list(dict.fromkeys(token_ids))
     books = fetch_books(token_ids, batch_size=300)
 
-    out = []
+    out: List[Dict[str, Any]] = []
     snap_time = _now_utc().isoformat()
 
     for m in tradable:
         tids = _parse_list(m.get("clobTokenIds"))
         outs = _parse_list(m.get("outcomes"))
-        if len(tids) < 2:
+        if len(tids) < 2 or len(outs) < 2:
             continue
 
-        t0, t1 = tids[0], tids[1]
-        o0 = outs[0] if len(outs) > 0 else "Yes"
-        o1 = outs[1] if len(outs) > 1 else "No"
+        yn = _find_yes_no_indices(outs)
+        if yn is None:
+            continue
+        idx_yes, idx_no = yn
 
-        b0, bs0, a0, as0 = best_bid_ask(books.get(t0, {}))
-        b1, bs1, a1, as1 = best_bid_ask(books.get(t1, {}))
+        if idx_yes >= len(tids) or idx_no >= len(tids):
+            continue
 
-        sp0 = spread_pct(b0, a0)
-        sp1 = spread_pct(b1, a1)
-        sps = [x for x in [sp0, sp1] if x is not None]
-        sp_mean = sum(sps)/len(sps) if sps else None
+        t_yes = tids[idx_yes]
+        t_no = tids[idx_no]
+        o_yes = outs[idx_yes]
+        o_no = outs[idx_no]
 
-        mid0 = mid_price(b0, a0)
-        mid1 = mid_price(b1, a1)
+        by, bsy, ay, asy = best_bid_ask(books.get(t_yes, {}))
+        bn, bsn, an, asn = best_bid_ask(books.get(t_no, {}))
+
+        has_quotes = (ay is not None and by is not None and an is not None and bn is not None)
+        if not has_quotes:
+            continue
+
+        sp_yes = spread_pct(by, ay)
+        sp_no = spread_pct(bn, an)
+        sps = [x for x in [sp_yes, sp_no] if x is not None]
+        sp_mean = sum(sps) / len(sps) if sps else None
+        if sp_mean is None:
+            continue
+
+        mid_yes = mid_price(by, ay)
+        mid_no = mid_price(bn, an)
+
+        if mid_yes is None or mid_no is None:
+            continue
+        if abs((mid_yes + mid_no) - 1.0) > 0.08:
+            continue
 
         vol24 = _num(m.get("volume24hrClob", m.get("volume24hr", m.get("volume24hrAmm", 0))))
         liq = _num(m.get("liquidityClob", m.get("liquidityNum", m.get("liquidity", 0))))
@@ -277,15 +368,7 @@ def build_candidates(max_markets: int = 2000) -> List[Dict[str, Any]]:
         ttd_h = time_to_deadline_hours(end_date)
         q = str(m.get("question", "") or "")
 
-        min_ask_size = min(_num(as0), _num(as1)) if (as0 is not None and as1 is not None) else 0.0
-        tier = tier_for(vol24, sp_mean, min_ask_size)
-
-        # hard filters for "analyze"
-        has_quotes = (a0 is not None and b0 is not None and a1 is not None and b1 is not None)
-        if not has_quotes:
-            continue
-        if sp_mean is None:
-            continue
+        min_ask_size = min(_num(asy), _num(asn)) if (asy is not None and asn is not None) else 0.0
         if min_ask_size < 20:
             continue
         if vol24 < 1000:
@@ -293,16 +376,29 @@ def build_candidates(max_markets: int = 2000) -> List[Dict[str, Any]]:
 
         ds = deadline_suspicious(q, end_date, ttd_h)
 
-        req0 = (a0 - mid0) if (a0 is not None and mid0 is not None) else None
-        req1 = (a1 - mid1) if (a1 is not None and mid1 is not None) else None
-        req_min = min([x for x in [req0, req1] if x is not None], default=None)
+        tier = tier_for(vol24, sp_mean, min_ask_size)
+
+        req_yes = (ay - mid_yes) if (ay is not None and mid_yes is not None) else None
+        req_no = (an - mid_no) if (an is not None and mid_no is not None) else None
+        req_min = min([x for x in [req_yes, req_no] if x is not None], default=None)
+
+        bucket = _bucket_for(
+            vol24=vol24,
+            liq=liq,
+            spread_mean=sp_mean,
+            min_ask_size=min_ask_size,
+            ttd_h=ttd_h,
+            deadline_flag=ds,
+            yes_ask=ay,
+            no_ask=an,
+        )
 
         out.append({
             "snapshot_time_utc": snap_time,
-            "market_id": str(m.get("id","")),
+            "market_id": str(m.get("id", "")),
             "question": q,
-            "slug": str(m.get("slug","") or ""),
-            "category": str(m.get("category","") or ""),
+            "slug": str(m.get("slug", "") or ""),
+            "category": str(m.get("category", "") or ""),
             "end_date": end_date,
             "time_to_deadline_hours": ttd_h,
             "deadline_suspicious": ds,
@@ -311,37 +407,51 @@ def build_candidates(max_markets: int = 2000) -> List[Dict[str, Any]]:
             "market_spread_pct_mean": sp_mean,
             "min_best_ask_size": min_ask_size,
             "tier": tier,
+            "bucket": bucket,
             "quality_score": quality_score(vol24, sp_mean, min_ask_size),
+            "yes_ask": ay,
+            "no_ask": an,
+            "yes_bid": by,
+            "no_bid": bn,
             "outcomes": [
                 {
-                    "name": o0,
-                    "token_id": t0,
-                    "best_bid": b0, "best_bid_size": bs0,
-                    "best_ask": a0, "best_ask_size": as0,
-                    "mid": mid0, "spread_pct": sp0,
-                    "req_edge_vs_mid": req0,
+                    "name": str(o_yes),
+                    "token_id": str(t_yes),
+                    "best_bid": by, "best_bid_size": bsy,
+                    "best_ask": ay, "best_ask_size": asy,
+                    "mid": mid_yes, "spread_pct": sp_yes,
+                    "req_edge_vs_mid": req_yes,
                 },
                 {
-                    "name": o1,
-                    "token_id": t1,
-                    "best_bid": b1, "best_bid_size": bs1,
-                    "best_ask": a1, "best_ask_size": as1,
-                    "mid": mid1, "spread_pct": sp1,
-                    "req_edge_vs_mid": req1,
+                    "name": str(o_no),
+                    "token_id": str(t_no),
+                    "best_bid": bn, "best_bid_size": bsn,
+                    "best_ask": an, "best_ask_size": asn,
+                    "mid": mid_no, "spread_pct": sp_no,
+                    "req_edge_vs_mid": req_no,
                 }
             ],
             "req_edge_min": req_min,
         })
 
-    # sort best first
-    out.sort(key=lambda x: (x["tier"] != "A", -x["quality_score"]))
+    out.sort(key=lambda x: (x.get("bucket") != "TRADE", x.get("tier") != "A", -x.get("quality_score", 0.0)))
     return out
 
-def make_batches(cands: List[Dict[str, Any]], tiers: List[str], batch_size: int) -> List[Dict[str, Any]]:
+def make_batches(
+    cands: List[Dict[str, Any]],
+    tiers: List[str],
+    batch_size: int,
+    include_watch_in_batches: bool = False,
+) -> List[Dict[str, Any]]:
     filtered = [c for c in cands if c.get("tier") in tiers]
+    if include_watch_in_batches:
+        filtered2 = [c for c in filtered if c.get("bucket") in ("TRADE", "WATCH")]
+    else:
+        filtered2 = [c for c in filtered if c.get("bucket") == "TRADE"]
+
     batches = []
-    for i in range(0, len(filtered), batch_size):
-        part = filtered[i:i+batch_size]
+    for i in range(0, len(filtered2), batch_size):
+        part = filtered2[i:i+batch_size]
         batches.append({
             "batch_id": f"{(i//batch_size)+1:02d}",
             "tiers": ",".join(tiers),
@@ -358,16 +468,33 @@ def run(
     tiers: str = Query("A,B", description="Comma-separated tiers to include, e.g. A,B"),
     batch_size: int = Query(20, ge=5, le=50),
     max_markets: int = Query(2000, ge=100, le=5000),
+    include_watch_in_batches: bool = Query(False, description="If true, include WATCH markets in LLM batches too"),
 ):
     tiers_list = [t.strip().upper() for t in tiers.split(",") if t.strip()]
     cands = build_candidates(max_markets=max_markets)
-    batches = make_batches(cands, tiers=tiers_list, batch_size=batch_size)
+
+    batches = make_batches(
+        cands,
+        tiers=tiers_list,
+        batch_size=batch_size,
+        include_watch_in_batches=include_watch_in_batches,
+    )
+
+    trade_total = sum(1 for c in cands if c.get("bucket") == "TRADE" and c.get("tier") in tiers_list)
+    watch_total = sum(1 for c in cands if c.get("bucket") == "WATCH" and c.get("tier") in tiers_list)
+    skip_total = sum(1 for c in cands if c.get("bucket") == "SKIP" and c.get("tier") in tiers_list)
+
     return {
         "run_id": _stamp(),
         "generated_at_utc": _now_utc().isoformat(),
         "tiers": tiers_list,
         "batch_size": batch_size,
+        "max_markets": max_markets,
+        "include_watch_in_batches": include_watch_in_batches,
         "candidates_total": len(cands),
+        "trade_total": trade_total,
+        "watch_total": watch_total,
+        "skip_total": skip_total,
         "batches_total": len(batches),
         "batches": batches,
     }
